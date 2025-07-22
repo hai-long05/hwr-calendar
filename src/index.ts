@@ -33,6 +33,16 @@ const shouldDeleteEvent = (event: string): boolean => {
   return DESCRIPTION_REGEX.test(event);
 };
 
+// Create minimal valid ICS header if missing
+const createMinimalICSHeader = (): string => {
+  return `BEGIN:VCALENDAR
+VERSION:2.0
+PRODID:-//Custom ICS Server//EN
+METHOD:PUBLISH
+CALSCALE:GREGORIAN
+`;
+};
+
 // Fetch, clean, and save ICS file
 const updateICSFile = async () => {
   try {
@@ -52,8 +62,30 @@ const updateICSFile = async () => {
       throw new Error('Invalid ICS file: Missing VCALENDAR wrapper');
     }
     
-    // Split into events - but preserve the calendar header
+    // Ensure proper ICS headers exist
+    let calendarHeader = '';
     const headerEndIndex = rawICS.indexOf('BEGIN:VEVENT');
+    
+    if (headerEndIndex === -1) {
+      console.log('No events found in ICS file');
+      // Create minimal valid calendar structure
+      calendarHeader = rawICS.includes('BEGIN:VCALENDAR') ? 
+        rawICS.substring(0, rawICS.indexOf('END:VCALENDAR')) : 
+        createMinimalICSHeader();
+    } else {
+      calendarHeader = rawICS.substring(0, headerEndIndex);
+    }
+    
+    // Ensure required headers are present
+    if (!calendarHeader.includes('VERSION:')) {
+      calendarHeader = calendarHeader.replace('BEGIN:VCALENDAR\n', 'BEGIN:VCALENDAR\nVERSION:2.0\n');
+    }
+    if (!calendarHeader.includes('PRODID:')) {
+      calendarHeader = calendarHeader.replace('BEGIN:VCALENDAR\n', 'BEGIN:VCALENDAR\nPRODID:-//Custom ICS Server//EN\n');
+    }
+    if (!calendarHeader.includes('METHOD:')) {
+      calendarHeader += 'METHOD:PUBLISH\n';
+    }
     
     if (headerEndIndex === -1) {
       console.log('No events found in ICS file');
@@ -64,10 +96,7 @@ const updateICSFile = async () => {
       return;
     }
     
-    const calendarHeader = rawICS.substring(0, headerEndIndex);
     const eventsSection = rawICS.substring(headerEndIndex);
-    const calendarFooter = eventsSection.includes('END:VCALENDAR') ? 
-      eventsSection.substring(eventsSection.lastIndexOf('END:VCALENDAR')) : 'END:VCALENDAR\n';
     
     // Split events properly
     const eventParts = eventsSection.split('BEGIN:VEVENT').filter(event => event.trim());
@@ -99,8 +128,7 @@ const updateICSFile = async () => {
     
     console.log(`Keeping ${validFilteredEvents.length} valid events after filtering`);
     
-    // Reconstruct ICS file with proper formatting
-    let cleanedICS = calendarHeader;
+    let cleanedICS = rawICS.substring(0, headerEndIndex);
     
     // Add events
     validFilteredEvents.forEach(event => {
@@ -142,14 +170,33 @@ updateICSFile();
 // Schedule updates every 6 hours (fixed cron syntax)
 cron.schedule('0 */6 * * *', updateICSFile);
 
+// Add CORS middleware
+app.use((req, res, next) => {
+  res.header('Access-Control-Allow-Origin', '*');
+  res.header('Access-Control-Allow-Methods', 'GET, OPTIONS');
+  res.header('Access-Control-Allow-Headers', 'Origin, X-Requested-With, Content-Type, Accept');
+  
+  if (req.method === 'OPTIONS') {
+    res.sendStatus(200);
+  } else {
+    next();
+  }
+});
+
 app.get('/calendar.ics', (req, res) => {
   try {
     if (!fs.existsSync(ICS_LOCAL_PATH)) {
       return res.status(404).send('Calendar file not found');
     }
     
-    res.setHeader('Content-Type', 'text/calendar');
-    res.setHeader('Content-Disposition', 'attachment; filename="calendar.ics"');
+    // Set proper headers for ICS file
+    res.setHeader('Content-Type', 'text/calendar; charset=utf-8');
+    res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
+    res.setHeader('Pragma', 'no-cache');
+    res.setHeader('Expires', '0');
+    
+    // Don't set Content-Disposition as attachment for subscription feeds
+    // res.setHeader('Content-Disposition', 'attachment; filename="calendar.ics"');
     
     const fileStream = fs.createReadStream(ICS_LOCAL_PATH);
     fileStream.pipe(res);
@@ -162,6 +209,25 @@ app.get('/calendar.ics', (req, res) => {
     console.error('Error serving ICS file:', error);
     res.status(500).send('Server error');
   }
+});
+
+// Add a route for Google Calendar subscription link
+app.get('/subscribe', (req, res) => {
+  const baseUrl = `${req.protocol}://${req.get('host')}`;
+  const icsUrl = `${baseUrl}/calendar.ics`;
+  const googleSubscribeUrl = `https://www.google.com/calendar/render?cid=webcal://${req.get('host')}/calendar.ics`;
+  
+  res.send(`
+    <html>
+      <head><title>Calendar Subscription</title></head>
+      <body>
+        <h1>Subscribe to Calendar</h1>
+        <p><strong>ICS URL:</strong> <a href="${icsUrl}">${icsUrl}</a></p>
+        <p><strong>Google Calendar:</strong> <a href="${googleSubscribeUrl}">Subscribe in Google Calendar</a></p>
+        <p><strong>Manual subscription:</strong> Copy this URL and paste it into your calendar app: <code>${icsUrl}</code></p>
+      </body>
+    </html>
+  `);
 });
 
 app.get('/', (_, res) => {
