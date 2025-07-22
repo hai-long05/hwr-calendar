@@ -39,49 +39,98 @@ const updateICSFile = async () => {
     const response = await axios.get(ICS_SOURCE_URL, { responseType: 'text' });
     let rawICS = response.data as string;
     
+    console.log('Raw ICS file size:', rawICS.length);
+    
+    // Normalize line endings first
+    rawICS = rawICS.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
+    
     // Unfold lines (join continuation lines)
-    rawICS = rawICS.replace(/\r?\n[ \t]/g, '');
+    rawICS = rawICS.replace(/\n[ \t]/g, '');
+    
+    // Validate basic ICS structure
+    if (!rawICS.includes('BEGIN:VCALENDAR') || !rawICS.includes('END:VCALENDAR')) {
+      throw new Error('Invalid ICS file: Missing VCALENDAR wrapper');
+    }
     
     // Split into events - but preserve the calendar header
     const headerEndIndex = rawICS.indexOf('BEGIN:VEVENT');
     
     if (headerEndIndex === -1) {
       console.log('No events found in ICS file');
+      // Still save the calendar structure even without events
+      const cleanedICS = rawICS.replace(/\n/g, '\r\n');
+      fs.mkdirSync(path.dirname(ICS_LOCAL_PATH), { recursive: true });
+      fs.writeFileSync(ICS_LOCAL_PATH, cleanedICS, 'utf-8');
       return;
     }
     
     const calendarHeader = rawICS.substring(0, headerEndIndex);
     const eventsSection = rawICS.substring(headerEndIndex);
+    const calendarFooter = eventsSection.includes('END:VCALENDAR') ? 
+      eventsSection.substring(eventsSection.lastIndexOf('END:VCALENDAR')) : 'END:VCALENDAR\n';
     
     // Split events properly
-    const events = eventsSection.split('BEGIN:VEVENT').filter(event => event.trim());
+    const eventParts = eventsSection.split('BEGIN:VEVENT').filter(event => event.trim());
     
-    console.log(`Found ${events.length} total events`);
+    console.log(`Found ${eventParts.length} total events`);
     
-    // Filter events
-    const filteredEvents = events.filter(event => {
-      const fullEvent = 'BEGIN:VEVENT' + event;
-      const shouldDelete = shouldDeleteEvent(fullEvent);
+    // Filter and validate events
+    const validFilteredEvents = eventParts.map(eventPart => {
+      const fullEvent = 'BEGIN:VEVENT' + eventPart;
+      return fullEvent;
+    }).filter(event => {
+      // Basic validation: ensure event has END:VEVENT
+      if (!event.includes('END:VEVENT')) {
+        console.log('Skipping invalid event (no END:VEVENT)');
+        return false;
+      }
+      
+      // Filter out unwanted events
+      const shouldDelete = shouldDeleteEvent(event);
       if (shouldDelete) {
-        // Extract summary for logging
-        const summaryMatch = fullEvent.match(/SUMMARY:([^\r\n]*)/);
+        const summaryMatch = event.match(/SUMMARY:([^\r\n]*)/);
         const summary = summaryMatch ? summaryMatch[1] : 'Unknown';
         console.log(`Filtering out event: ${summary}`);
+        return false;
       }
-      return !shouldDelete;
+      
+      return true;
     });
     
-    console.log(`Keeping ${filteredEvents.length} events after filtering`);
+    console.log(`Keeping ${validFilteredEvents.length} valid events after filtering`);
     
-    // Reconstruct ICS file
-    const cleanedEvents = filteredEvents.map(event => 'BEGIN:VEVENT' + event).join('');
-    const cleanedICS = calendarHeader + cleanedEvents;
+    // Reconstruct ICS file with proper formatting
+    let cleanedICS = calendarHeader;
+    
+    // Add events
+    validFilteredEvents.forEach(event => {
+      cleanedICS += event;
+    });
+    
+    // Ensure proper calendar ending
+    if (!cleanedICS.endsWith('END:VCALENDAR')) {
+      if (cleanedICS.includes('END:VCALENDAR')) {
+        // Remove existing END:VCALENDAR and add it properly
+        cleanedICS = cleanedICS.substring(0, cleanedICS.lastIndexOf('END:VCALENDAR'));
+      }
+      cleanedICS += 'END:VCALENDAR\n';
+    }
+    
+    // Convert to CRLF line endings as required by ICS standard
+    cleanedICS = cleanedICS.replace(/\n/g, '\r\n');
     
     // Ensure directory exists
     fs.mkdirSync(path.dirname(ICS_LOCAL_PATH), { recursive: true });
     fs.writeFileSync(ICS_LOCAL_PATH, cleanedICS, 'utf-8');
     
-    console.log(`[${new Date().toISOString()}] ICS fetched and cleaned. Final events: ${filteredEvents.length}`);
+    console.log(`[${new Date().toISOString()}] ICS fetched and cleaned. Final events: ${validFilteredEvents.length}`);
+    console.log('Final ICS file size:', cleanedICS.length);
+    
+    // Log first few lines for debugging
+    const firstLines = cleanedICS.split('\r\n').slice(0, 10).join('\r\n');
+    console.log('First 10 lines of ICS file:');
+    console.log(firstLines);
+    
   } catch (error) {
     console.error(`Error updating ICS:`, error);
   }
@@ -93,7 +142,7 @@ updateICSFile();
 // Schedule updates every 6 hours (fixed cron syntax)
 cron.schedule('0 */6 * * *', updateICSFile);
 
-app.get('/calendar.ics', (_, res) => {
+app.get('/calendar.ics', (req, res) => {
   try {
     if (!fs.existsSync(ICS_LOCAL_PATH)) {
       return res.status(404).send('Calendar file not found');
